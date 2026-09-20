@@ -67,9 +67,13 @@ struct task *task_create_(struct task *parent) {
         unlock(&pids_lock);
         return NULL;
     }
-    *task = (struct task) {};
-    if (parent != NULL)
+    memset(task, 0, sizeof(struct task));
+    if (parent != NULL) {
+        // Copy parent state field-by-field to avoid copying the mem pointer
+        // (which aliases parent's mm.mem). task_set_mm will fix it later.
         *task = *parent;
+        task->mem = NULL; // will be set by task_set_mm after mm_copy
+    }
     task->pid = pid->id;
     pid->task = task;
 
@@ -120,6 +124,20 @@ struct task *task_create_(struct task *parent) {
 
     lock_init(&task->ptrace.lock);
     cond_init(&task->ptrace.cond);
+
+    // Copy memory mapping so the new task has its own page tables.
+    // Without this, the child aliases the parent's mm — writes to the
+    // parent's pages trigger SIGBUS because the child's pt is the same
+    // object and CoW tracking gets confused.
+    if (parent != NULL && parent->mm != NULL) {
+        struct mm *child_mm = mm_copy(parent->mm);
+        if (child_mm == NULL) {
+            task_destroy(task);
+            return NULL;
+        }
+        task_set_mm(task, child_mm);
+    }
+
     return task;
 }
 
