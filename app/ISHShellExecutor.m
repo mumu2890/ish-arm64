@@ -246,12 +246,26 @@ static dispatch_once_t _onceToken;
     // Get guest PID and start task
     ctx.guestPid = task->pid;
     ctx.result.pid = ctx.guestPid;
-    task_start(task);
-    current = saved_current;
-
-    // Register context
+    NSNumber *pidKey = @(ctx.guestPid);
     @synchronized(_activeExecutions) {
-        _activeExecutions[@(ctx.guestPid)] = ctx;
+        _activeExecutions[pidKey] = ctx;
+    }
+
+    // [T-ish-task-start-checked] Check pthread_create result. A failed
+    // start leaves a task that exists but never runs; the vfork parent
+    // would wait on it forever. Clean up and report the failure.
+    int startError = task_start_checked(task);
+    current = saved_current;
+    if (startError != 0) {
+        @synchronized(_activeExecutions) {
+            if (_activeExecutions[pidKey] == ctx) {
+                [_activeExecutions removeObjectForKey:pidKey];
+            }
+        }
+        [ctx cleanup];
+        NSLog(@"ISHShellExecutor: pthread_create failed: %d (%s)",
+              startError, strerror(startError));
+        return ISHShellExecutorErrorProcessCreationFailed;
     }
 
     // Start reader threads

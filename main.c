@@ -64,10 +64,17 @@ static_assert(CRASH_LOCAL_jit_exit_sp      == LOCAL_jit_exit_sp,      "cpu-offse
 
 static void crash_handler(int sig, siginfo_t *info, void *ctx) {
 #if defined(__aarch64__) && defined(GUEST_ARM64)
+    // [T-ish-sigbus-guard] Only treat synchronous memory faults (si_code > 0)
+    // with valid ucontext as JIT crashes. Async SIGBUS (e.g. from a dying
+    // filesystem or bus error delivered to a non-JIT thread) must fall through
+    // to the non-JIT dump path instead of corrupting a healthy thread's
+    // ucontext.
+    int synchronous_memory_fault =
+        (sig == SIGSEGV || sig == SIGBUS) && info != NULL && info->si_code > 0 && ctx != NULL;
     // If we're inside JIT code and got SIGSEGV/SIGBUS, recover by redirecting
     // execution to jit_crash_trampoline via ucontext PC manipulation.
     // This avoids the overhead of _setjmp on every block entry.
-    if ((sig == SIGSEGV || sig == SIGBUS) && in_jit) {
+    if (synchronous_memory_fault && in_jit) {
         ucontext_t *uc = (ucontext_t *)ctx;
 
         // _cpu is in x1 — pointer to cpu_state within fiber_frame

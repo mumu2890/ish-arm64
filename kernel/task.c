@@ -229,7 +229,8 @@ void task_run_current() {
         }
         read_wrlock(&self->mem->lock);
         tlb_refresh(tlb, &self->mem->mmu);
-        int interrupt = cpu_run_to_interrupt(cpu, tlb);
+        extern int cpu_run_to_interrupt_unicorn(struct cpu_state *, struct tlb *);
+        int interrupt = cpu_run_to_interrupt_unicorn(cpu, tlb);
         read_wrunlock(&self->mem->lock);
         handle_interrupt(interrupt);
     }
@@ -252,13 +253,17 @@ __attribute__((constructor)) static void create_attr() {
     pthread_attr_setdetachstate(&task_thread_attr, PTHREAD_CREATE_DETACHED);
 }
 
+int task_start_checked(struct task *task) {
+    return pthread_create(&task->thread, &task_thread_attr, task_thread, task);
+}
+
 int task_start(struct task *task) {
     // pthread_create returns an errno directly and never -1, so the old
     // "< 0" test never fired and a failure fell through to a task whose
     // thread was never started. Under thread-stack exhaustion (EAGAIN) that
     // has to become a guest-visible clone() failure, not a dead task or a
     // die(). [T-ish-jit-oom-abort]
-    int err = pthread_create(&task->thread, &task_thread_attr, task_thread, task);
+    int err = task_start_checked(task);
     if (err != 0)
         return err == EAGAIN ? _EAGAIN : _ENOMEM;
     return 0;

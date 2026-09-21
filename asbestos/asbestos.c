@@ -1,6 +1,7 @@
 #define DEFAULT_CHANNEL instr
 #include "debug.h"
 #include <signal.h>
+#include <sys/mman.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -506,7 +507,8 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
         if (spec != NULL) {
             gen_prebuilt_block(&state, (void *) spec);
             if (state.oom) {  // see the OOM note at the tail of this function
-                free(state.block);
+                size_t oom_alloc = (sizeof(struct fiber_block) + state.capacity * sizeof(unsigned long) + 4095) & ~4095;
+                munmap(state.block, oom_alloc);
                 ISH_SIGNPOST_SCOPE_END(jit, "block_compile", _bc_spid);
                 return NULL;
             }
@@ -541,7 +543,8 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
     // would keep growing. After a failed realloc they can exceed the block's
     // real capacity, so running gen_end() here would overflow the heap.
     if (state.oom) {
-        free(state.block);
+        size_t oom_alloc = (sizeof(struct fiber_block) + state.capacity * sizeof(unsigned long) + 4095) & ~4095;
+        munmap(state.block, oom_alloc);
         ISH_SIGNPOST_SCOPE_END(jit, "block_compile", _bc_spid);
         return NULL;
     }
@@ -632,14 +635,19 @@ static void fiber_block_disconnect(struct asbestos *asbestos, struct fiber_block
 
 static void fiber_block_free(struct asbestos *asbestos, struct fiber_block *block) {
     fiber_block_disconnect(asbestos, block);
-    free(block);
+    // Unmap the mmap'd block (size was rounded up to page boundary at alloc)
+    size_t cap = block->used;  // used stores the capacity
+    size_t alloc_size = (sizeof(struct fiber_block) + cap * sizeof(unsigned long) + 4095) & ~4095;
+    munmap(block, alloc_size);
 }
 
 static void fiber_free_jetsam(struct asbestos *asbestos) {
     struct fiber_block *block, *tmp;
     list_for_each_entry_safe(&asbestos->jetsam, block, tmp, jetsam) {
         list_remove(&block->jetsam);
-        free(block);
+        size_t cap = block->used;
+        size_t alloc_size = (sizeof(struct fiber_block) + cap * sizeof(unsigned long) + 4095) & ~4095;
+        munmap(block, alloc_size);
     }
 }
 

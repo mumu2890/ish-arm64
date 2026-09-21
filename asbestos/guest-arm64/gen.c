@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/mman.h>
 #include "asbestos/gen.h"
 #include "emu/arch/arm64/decode.h"
 #include "emu/interrupt.h"
@@ -887,17 +888,20 @@ static void gen(struct gen_state *state, unsigned long thing) {
         return;
     if (state->size >= state->capacity) {
         unsigned new_capacity = state->capacity * 2;
-        struct fiber_block *new_block = realloc(state->block,
-                sizeof(*new_block) + new_capacity * sizeof(unsigned long));
-        if (new_block == NULL) {
-            // Aborting here killed the entire app -- every guest thread, plus
-            // the Swift UI side -- because one guest process asked for more
-            // memory than was available. Record the failure instead and let the
-            // compile fail; the run loop raises INT_GPF, which kills only the
-            // guest process that could not be compiled. [T-ish-jit-oom-abort]
+        size_t old_size = sizeof(struct fiber_block) + state->capacity * sizeof(unsigned long);
+        size_t old_alloc = (old_size + 4095) & ~4095;
+        size_t new_size = sizeof(struct fiber_block) + new_capacity * sizeof(unsigned long);
+        size_t new_alloc = (new_size + 4095) & ~4095;
+        struct fiber_block *new_block = mmap(NULL, new_alloc, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (new_block == MAP_FAILED) {
             state->oom = true;
             return;
         }
+        // Copy header + code array
+        memcpy(new_block, state->block, old_size);
+        // Zero the new portion
+        memset((char *)new_block + old_size, 0, new_alloc - old_alloc);
+        munmap(state->block, old_alloc);
         state->capacity = new_capacity;
         state->block = new_block;
     }
@@ -926,8 +930,11 @@ bool gen_start(addr_t addr, struct gen_state *state) {
     }
     state->block_patch_ip = 0;
 
-    struct fiber_block *block = malloc(sizeof(struct fiber_block) + state->capacity * sizeof(unsigned long));
-    if (block == NULL)
+    size_t block_size = sizeof(struct fiber_block) + state->capacity * sizeof(unsigned long);
+    // Round up to page size for mmap
+    size_t alloc_size = (block_size + 4095) & ~4095;
+    struct fiber_block *block = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (block == MAP_FAILED)
         return false;
     state->block = block;
     block->addr = addr;

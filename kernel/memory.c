@@ -1,4 +1,8 @@
 #include <fcntl.h>
+#include <stdint.h>
+#include <unicorn/unicorn.h>
+extern void uc_page_map(uint64_t guest_addr, void *host_ptr, uint32_t size, int prot);
+extern void uc_page_unmap(uint64_t guest_addr, uint32_t size);
 #include <unistd.h>
 #include <sched.h>
 #include <sys/mman.h>
@@ -591,14 +595,24 @@ int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, size_t of
         pt->offset = ((page - start) << PAGE_BITS) + offset;
         pt->flags = flags;
 
+        // Unicorn: map this guest page to its host page
+        uint64_t guest_addr = (uint64_t)page << PAGE_BITS;
+        void *host_ptr = (char *)memory + ((page - start) << PAGE_BITS) + offset;
+        int prot = 0;
+        if (flags & P_EXEC) prot |= UC_PROT_EXEC;
+        if (flags & P_WRITE) prot |= UC_PROT_WRITE;
+        prot |= UC_PROT_READ;
+        uc_page_map(guest_addr, host_ptr, PAGE_SIZE, prot);
     }
     return 0;
 }
 
 int pt_unmap(struct mem *mem, page_t start, pages_t pages) {
-    for (page_t page = start; page < start + pages; page++)
+    for (page_t page = start; page < start + pages; page++) {
+        uc_page_unmap((uint64_t)page << PAGE_BITS, PAGE_SIZE);
         if (mem_pt(mem, page) == NULL)
             return -1;
+    }
     return pt_unmap_always(mem, start, pages);
 }
 
