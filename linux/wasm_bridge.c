@@ -8,11 +8,13 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <sys/mman.h>
+#include <errno.h>
 
 #include "wasm_export.h"
 
 static bool g_wasm_init = false;
-static char g_debug_buf[2048] = {0};
+static char g_debug_buf[8192] = {0};
 
 const char *wasm_bridge_get_debug(void) { return g_debug_buf; }
 
@@ -21,6 +23,15 @@ const char *wasm_bridge_get_debug(void) { return g_debug_buf; }
 void wasm_bridge_init(void)
 {
     if (g_wasm_init) return;
+    // Test system mmap (same as WAMR's os_mmap)
+    void *test_mem = mmap(NULL, 131072, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (test_mem != MAP_FAILED) {
+        mprotect(test_mem, 131072, PROT_READ | PROT_WRITE);
+        munmap(test_mem, 131072);
+        fprintf(stderr, "[wasm] mmap test: OK\\n");
+    } else {
+        fprintf(stderr, "[wasm] mmap test: FAILED (errno=%d)\\n", errno);
+    }
     wasm_runtime_init();
     wasm_runtime_set_default_running_mode(Mode_Interp);
     g_wasm_init = true;
@@ -78,12 +89,18 @@ void *wasm_bridge_instantiate(void *module, uint32_t stack_size, uint32_t heap_s
 {
     if (!module) return NULL;
 
+    // Set up WASI args: no preopen dirs (iOS /tmp may not exist), provide argv
+    static char *wasi_argv[] = { "hello" };
+    wasm_runtime_set_wasi_args(
+        (wasm_module_t)module, NULL, 0, NULL, 0, NULL, 0, wasi_argv, 1);
+
     char err[256] = {0};
     wasm_module_inst_t inst = wasm_runtime_instantiate(
         (wasm_module_t)module, stack_size, heap_size, err, sizeof(err));
 
     if (!inst) {
         fprintf(stderr, "[wasm] instantiate failed: %s\n", err);
+        g_debug_buf[0] = 0; DBG("instantiate failed: %s\n", err);
         return NULL;
     }
 
@@ -146,4 +163,32 @@ int wasm_bridge_export_count(void *module)
 {
     if (!module) return -1;
     return wasm_runtime_get_export_count((wasm_module_t)module);
+}
+
+/* WASI execution: use wasm_application_execute_main to run _start
+   with WASI native functions registered */
+bool wasm_bridge_wasi_execute(void *instance)
+{
+    if (!instance) return false;
+
+    wasm_module_inst_t mi = (wasm_module_inst_t)instance;
+
+    // Check for _start export
+    wasm_function_inst_t start_func = wasm_runtime_lookup_function(mi, "_start");
+    if (!start_func) {
+        fprintf(stderr, "[wasi] _start not found\\n");
+        return false;
+    }
+
+    // Execute via wasm_application_execute_main
+    // This handles WASI import resolution + execution
+    bool ok = wasm_application_execute_main(mi, 0, NULL);
+
+    const char *exception = wasm_runtime_get_exception(mi);
+    if (exception) {
+        fprintf(stderr, "[wasi] exception: %s\\n", exception);
+    }
+
+    fprintf(stderr, "[wasi] execute_main ok=%d\\n", ok);
+    return ok;
 }
