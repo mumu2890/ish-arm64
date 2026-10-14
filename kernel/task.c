@@ -275,7 +275,7 @@ void task_run_current(struct task *self) {
         // do_exit (exit.c) and the wait_for park (util/sync.c) release this
         // lock across blocking windows so a parked thread doesn't strand
         // its siblings.
-        pthread_mutex_lock(&guest_engine_lock);        pthread_mutex_lock(&guest_engine_lock);
+        pthread_mutex_lock(&guest_engine_lock);
         current = self;
         self->engine_held = 1;
         if (self->group->doing_group_exit) {
