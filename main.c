@@ -496,5 +496,7 @@ int main(int argc, char *const argv[]) {
     }
     do_mount(&procfs, "proc", "/proc", "", 0);
     do_mount(&devptsfs, "devpts", "/dev/pts", "", 0);
-    task_run_current();
+    // Host CLI: the main thread is init's task (current was set by
+    // become_first_process), so pass it explicitly.
+    task_run_current(current);
 }

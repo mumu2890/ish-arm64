@@ -26,8 +26,8 @@ void fs_register(const struct fs_ops *fs) {
 // === MOUNT CACHE: Thread-local cache for mount lookups ===
 // Most file operations use the same mount point (e.g., realfs at "/")
 // Caching the last lookup can save repeated list traversals
-static __thread struct mount *last_mount_cache = NULL;
-static __thread uint64_t mount_cache_version = 0;
+static struct mount *last_mount_cache = NULL;
+static uint64_t mount_cache_version = 0;
 static uint64_t global_mount_version = 0;  // Incremented on mount/umount
 
 // Check if cached mount is valid for given path

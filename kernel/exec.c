@@ -253,8 +253,9 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
 #endif
         }
 
-        if ((err = load_entry(ph[i], bias, fd)) < 0)
+        if ((err = load_entry(ph[i], bias, fd)) < 0) {
             goto beyond_hope;
+        }
 
         // load_addr is used to get a value for AX_PHDR et al
         if (!load_addr_set) {

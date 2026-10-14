@@ -45,10 +45,10 @@ static inline int fast_write(struct cpu_state *cpu);
 #endif
 
 // Diagnostic: JIT crash info from signal handler
-__thread volatile uint64_t jit_last_host_fault = 0;
-__thread volatile uint64_t jit_last_x7 = 0;
-__thread volatile uint64_t jit_last_x10 = 0;
-__thread volatile int jit_crash_count = 0;
+ volatile uint64_t jit_last_host_fault = 0;
+ volatile uint64_t jit_last_x7 = 0;
+ volatile uint64_t jit_last_x10 = 0;
+ volatile int jit_crash_count = 0;
 
 static _Atomic(ish_timer_tick_hook_t) g_timer_tick_hook = NULL;
 
@@ -290,11 +290,11 @@ void handle_interrupt(int interrupt) {
         // is stuck on an un-recoverable fault. Legitimate recovery
         // cycles (stack growsdown, V8 heap demand-map) change the
         // fault address each iteration so the counter resets.
-        static _Thread_local uint64_t last_stuck_pc_task = 0;
-        static _Thread_local uint64_t last_stuck_pc = 0;
-        static _Thread_local uint64_t last_stuck_fault = 0;
-        static _Thread_local int last_stuck_write = 0;
-        static _Thread_local int stuck_pc_count = 0;
+        static uint64_t last_stuck_pc_task = 0;
+        static uint64_t last_stuck_pc = 0;
+        static uint64_t last_stuck_fault = 0;
+        static int last_stuck_write = 0;
+        static int stuck_pc_count = 0;
         if (last_stuck_pc == cpu->pc &&
             last_stuck_pc_task == (uint64_t)current->pid &&
             last_stuck_fault == cpu->segfault_addr &&
@@ -512,9 +512,9 @@ void handle_interrupt(int interrupt) {
             // 48-bit upper range, is a sentinel pointer dereference.
             {
                 // Rate-limit V8 zone fix recoveries to prevent cascading
-                static _Thread_local int v8_zone_fix_count = 0;
-                static _Thread_local int v8_burst_count = 0;    // consecutive recoveries
-                static _Thread_local uint64_t v8_last_recovery_pc = 0;
+                static int v8_zone_fix_count = 0;
+                static int v8_burst_count = 0;    // consecutive recoveries
+                static uint64_t v8_last_recovery_pc = 0;
                 (void)0;
 
                 // Detect faults on corrupt/sentinel pointers.
@@ -996,8 +996,8 @@ void handle_interrupt(int interrupt) {
             // Rate-limited to prevent infinite loops on true null-pointer derefs.
 #ifdef GUEST_ARM64
             if (!cpu->segfault_was_write) {
-                static _Thread_local int read_recovery_count = 0;
-                static _Thread_local addr_t last_recovery_addr = 0;
+                static int read_recovery_count = 0;
+                static addr_t last_recovery_addr = 0;
                 // Reset counter when faulting address changes (scanner moving through memory)
                 // Only rate-limit when stuck at the exact same PC AND address (true infinite loop)
                 if (cpu->segfault_addr != last_recovery_addr) {

@@ -9,7 +9,7 @@
 #include "kernel/memory.h"
 #include "emu/tlb.h"
 
-__thread struct task *current;
+struct task *current = NULL;
 
 static struct pid pids[MAX_PID + 1] = {};
 lock_t pids_lock = LOCK_INITIALIZER;
@@ -141,6 +141,50 @@ struct task *task_create_(struct task *parent) {
     return task;
 }
 
+// Share identity fields from src into a freshly zeroed task (as created by
+// task_create_(NULL)): process group, fs (root/pwd/umask), fdtable and the
+// credential fields — shallow pointer sharing, exactly what fork's
+// `*task = *parent` does, minus the mm/mem copy (which is what breaks kernel
+// malloc when src is the boot-time init task). mm is created later by
+// elf_exec's mm_new+swap. Safe to call outside pids_lock: no lists touched.
+void task_inherit_identity(struct task *dst, struct task *src) {
+    // Give dst its own thread group, exactly like a fork without
+    // CLONE_THREAD_ (fork.c:125-130): fresh tgroup, leader = self,
+    // tgid = own pid, and the group_links list_add goes to the NEW list
+    // (the zeroed group_links is not on any list yet, and exit_tgroup's
+    // list_remove would dereference NULL prev/next otherwise).
+    // Joining src's tgroup instead is fatal here: the guest's fatal-signal
+    // path calls do_exit_group, which SIGKILLs every member of the shared
+    // group (the parked init, any other exec'd task) and, after its wait
+    // timeout, its safety valve force-releases their fdtables/sighands/fs
+    // - collapsing the refcounts of the shared stdio fds into a
+    // double-free (host SIGSEGV inside fd_close's free()).
+    dst->group = tgroup_copy(src->group);
+    dst->group->leader = dst;
+    dst->tgid = dst->pid;
+    list_add(&dst->group->threads, &dst->group_links);
+    // fs_info is refcounted (fs_info_release in do_exit would otherwise drop
+    // init's fs_info to zero and free it — same UAF class as the fd table).
+    dst->fs    = fs_info_copy(src->fs);
+    // Copy (not share) the fd table: fdtable_release in do_exit drops the
+    // refcount to zero and would FREE + CLOSE init's table (including its
+    // bound host stdout) while init is still parked — the UAF that wedged
+    // every second exec (lock taken on freed memory looks like a locked
+    // pthread mutex and parks forever). fork.c:97 does the same via
+    // fdtable_copy.
+    dst->files = fdtable_copy(src->files);
+    dst->uid  = src->uid;  dst->gid  = src->gid;
+    dst->euid = src->euid; dst->egid = src->egid;
+    dst->suid = src->suid; dst->sgid = src->sgid;
+    // Share the signal table exactly like fork's CLONE_SIGHAND_ (fork.c:114):
+    // a zeroed task has sighand==NULL, and the first guest sigaction/sigprocmask
+    // syscall dereferences current->sighand->lock -> SIGSEGV. The refcount bump
+    // keeps init's table alive if the guest exits first (do_exit releases it).
+    dst->sighand = src->sighand;
+    if (dst->sighand != NULL)
+        dst->sighand->refcount++;
+}
+
 // Deferred-free list for task structs.
 // When a task is destroyed, its struct is not immediately freed — instead it's
 // placed on this list. The NEXT call to task_destroy will free previously
@@ -198,8 +242,11 @@ static void task_run_tlb_cleanup(void *arg) {
     }
 }
 
-void task_run_current() {
-    struct cpu_state *cpu = &current->cpu;
+void task_run_current(struct task *self) {
+    // [T-ish-current-global] self is this thread's own task (passed from
+    // task_thread). current is a process-wide global that any other guest
+    // thread may overwrite at any time — never derive our state from it.
+    struct cpu_state *cpu = &self->cpu;
     struct tlb *tlb = calloc(1, sizeof(struct tlb));
     if (!tlb) die("could not allocate TLB");
 
@@ -211,20 +258,32 @@ void task_run_current() {
     pthread_cleanup_push(task_run_tlb_cleanup, tlb);
 
     while (true) {
-        // Check for group exit before entering JIT — this catches threads
-        // returning from blocking host syscalls (futex, nanosleep, etc.)
-        // that were interrupted by SIGUSR1 from do_exit_group.
-        // Also bail if our task struct was destroyed (current zeroed or NULLed).
-        struct task *self = current;
+        // Bail if our task struct was destroyed (zeroed or NULLed). Checked
+        // on self (this thread's own task), not the process-wide current
+        // global, which another guest thread may have overwritten.
         if (self == NULL || self->group == NULL) {
             // Task struct was destroyed under us (leaked thread).
             // Exit the host thread silently; cleanup handler frees tlb.
             pthread_exit(NULL);
         }
+        // [T-ish-current-global] Only ONE guest thread may run the engine +
+        // syscall dispatch at a time: every kernel path inside
+        // handle_interrupt resolves current to whatever the last thread
+        // wrote, so two concurrent guest threads would operate on each
+        // other's tasks (this is what wedged sh -c fork chains: the
+        // parent's wait4 and the child's engine ran on the same global).
+        // do_exit (exit.c) and the wait_for park (util/sync.c) release this
+        // lock across blocking windows so a parked thread doesn't strand
+        // its siblings.
+        pthread_mutex_lock(&guest_engine_lock);        pthread_mutex_lock(&guest_engine_lock);
+        current = self;
+        self->engine_held = 1;
         if (self->group->doing_group_exit) {
             do_exit(self->group->group_exit_code);
         }
         if (self->mem == NULL) {
+            self->engine_held = 0;
+            pthread_mutex_unlock(&guest_engine_lock);
             pthread_exit(NULL);
         }
         read_wrlock(&self->mem->lock);
@@ -233,6 +292,12 @@ void task_run_current() {
         int interrupt = cpu_run_to_interrupt_unicorn(cpu, tlb);
         read_wrunlock(&self->mem->lock);
         handle_interrupt(interrupt);
+        if (self->engine_held) {
+            // do_exit already released it (and the thread may pthread_exit
+            // inside it); a bare unlock would be UB in that case.
+            self->engine_held = 0;
+            pthread_mutex_unlock(&guest_engine_lock);
+        }
     }
 
     // Never reached in practice (loop only exits via pthread_exit/do_exit),
@@ -241,16 +306,38 @@ void task_run_current() {
 }
 
 static void *task_thread(void *vtask) {
-    current = vtask;
-    update_thread_name();
-    task_run_current();
+    // [T-ish-current-global] Do NOT publish vtask to the process-wide
+    // current here: this thread has not taken guest_engine_lock yet, and
+    // the store would stomp the current of the task that just forked us
+    // (it is still running under the engine lock). task_run_current sets
+    // current = self under the engine lock on every engine iteration.
+    // Name the host thread from vtask directly (same format as
+    // update_thread_name, which reads the global current).
+    {
+        struct task *vt = vtask;
+        char tname[16];
+        size_t pid_width = snprintf(tname, sizeof(tname), "-%d", vt->pid);
+        size_t name_width = snprintf(tname, sizeof(tname), "%s", vt->comm);
+        sprintf(tname + (name_width < sizeof(tname) - 1 - pid_width ? name_width : sizeof(tname) - 1 - pid_width), "-%d", vt->pid);
+#if __APPLE__
+        pthread_setname_np(tname);
+#else
+        pthread_setname_np(pthread_self(), tname);
+#endif
+    }
+    task_run_current(vtask);
     die("task_thread returned"); // above function call should never return
 }
 
+// [T-ish-current-global] Serializes guest engine execution (task_run_current).
+// do_exit (exit.c) and the wait_for park (util/sync.c) release it across
+// blocking windows so one parked guest thread doesn't strand the rest.
+pthread_mutex_t guest_engine_lock;
 static pthread_attr_t task_thread_attr;
 __attribute__((constructor)) static void create_attr() {
     pthread_attr_init(&task_thread_attr);
     pthread_attr_setdetachstate(&task_thread_attr, PTHREAD_CREATE_DETACHED);
+    pthread_mutex_init(&guest_engine_lock, NULL);
 }
 
 int task_start_checked(struct task *task) {

@@ -110,8 +110,8 @@ static void output_line(const char *line) {
 void ish_vprintk(const char *msg, va_list args) {
     // format the message
     // I'm trusting you to not pass an absurdly long message
-    static __thread char buf[16384] = "";
-    static __thread size_t buf_size = 0;
+    static char buf[16384] = "";
+    static size_t buf_size = 0;
     buf_size += vsprintf(buf + buf_size, msg, args);
 
     // output up to the last newline, leave the rest in the buffer

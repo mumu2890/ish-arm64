@@ -1065,7 +1065,7 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
 
     page_t page = PAGE(addr);
     struct pt_entry *entry = mem_pt(mem, page);
-    extern __thread volatile sig_atomic_t in_jit;
+    extern volatile sig_atomic_t in_jit;
 
     if (entry == NULL) {
         // page does not exist

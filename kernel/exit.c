@@ -52,30 +52,48 @@ static struct task *find_new_parent(struct task *task) {
 }
 
 noreturn void do_exit(int status) {
+    // [T-ish-current-global] Capture our own task pointer and use it for
+    // everything below. After the engine lock is released further down,
+    // other guest threads keep publishing their own task to the
+    // process-wide `current` global; the old code READ that global here
+    // (sometimes getting a different live task) and STORED `current = NULL`
+    // into it without the engine lock, stomping a just-woken task's
+    // current so its next syscall (e.g. sys_brk: current->mem->lock)
+    // crashed on NULL. The global now only changes hands under
+    // guest_engine_lock (task.c iteration start, sync.c wake, exec swap).
+    struct task *me = current;
+    // [T-ish-current-global] Release the guest engine lock before this host
+    // thread can pthread_exit: a pthread mutex held by a dead thread stays
+    // locked forever and would strand every other guest thread.
+    if (me && me->engine_held) {
+        me->engine_held = 0;
+        pthread_mutex_unlock(&guest_engine_lock);
+    }
     /* pid 1 dumps to stderr (the original behaviour). With ISH_PC_HIST_DIR set,
      * EVERY exiting process also dumps its own per-pid histogram file, so a
      * fork'd chain (pip wheel-build subprocesses) is captured whole. */
     extern void dump_pc_hist(void);
     extern void dump_pc_trace(void);
     extern char *getenv(const char *);
-    if (current && (current->pid == 1 || getenv("ISH_PC_HIST_DIR"))) {
+    if (me && (me->pid == 1 || getenv("ISH_PC_HIST_DIR"))) {
         dump_pc_hist();
-        if (current->pid == 1) dump_pc_trace();
+        if (me->pid == 1) dump_pc_trace();
     }
     { extern void dump_wx_stats(void);
       static int wx_dumped = 0;
-      if (!wx_dumped && current && current->pid == 1) { wx_dumped = 1; dump_wx_stats(); } }
+      if (!wx_dumped && me && me->pid == 1) { wx_dumped = 1; dump_wx_stats(); } }
     // If this thread was already marked as leaked by the safety valve,
     // the group leader has finished exiting and the group struct may be
     // freed. Don't touch any shared state — just kill the host thread.
-    if (current->exiting) {
-        current = NULL;
+    if (me->exiting) {
+        if (current == me)
+            current = NULL;
         pthread_exit(NULL);
     }
 
     // Block SIGSEGV during exit to prevent cosmetic crashes from host
     // pthread stack unwinding (especially with many threads exiting at once).
-    if (current->group->doing_group_exit) {
+    if (me->group->doing_group_exit) {
         sigset_t set;
         sigemptyset(&set);
         sigaddset(&set, SIGSEGV);
@@ -84,7 +102,7 @@ noreturn void do_exit(int status) {
     }
 
     // has to happen before mm_release
-    addr_t clear_tid = current->clear_tid;
+    addr_t clear_tid = me->clear_tid;
     if (clear_tid) {
         pid_t_ zero = 0;
         if (user_put(clear_tid, zero) == 0)
@@ -92,75 +110,75 @@ noreturn void do_exit(int status) {
     }
 
     // release all our resources (may already be NULL if force-released by do_exit_group)
-    if (current->mm != NULL) {
-        mm_release(current->mm);
-        current->mm = NULL;
+    if (me->mm != NULL) {
+        mm_release(me->mm);
+        me->mm = NULL;
         // [T-ish-mm-leak-refcount-handoff] We just released it, so the pthread
         // cleanup handler must NOT release again.
-        current->mm_release_deferred = false;
+        me->mm_release_deferred = false;
     }
-    if (current->files != NULL) {
-        fdtable_release(current->files);
-        current->files = NULL;
+    if (me->files != NULL) {
+        fdtable_release(me->files);
+        me->files = NULL;
     }
-    if (current->fs != NULL) {
-        fs_info_release(current->fs);
-        current->fs = NULL;
+    if (me->fs != NULL) {
+        fs_info_release(me->fs);
+        me->fs = NULL;
     }
     // Close per-thread futex wakeup pipe
-    if (current->futex_pipe[0] != -1) {
-        close(current->futex_pipe[0]);
-        current->futex_pipe[0] = -1;
+    if (me->futex_pipe[0] != -1) {
+        close(me->futex_pipe[0]);
+        me->futex_pipe[0] = -1;
     }
-    if (current->futex_pipe[1] != -1) {
-        close(current->futex_pipe[1]);
-        current->futex_pipe[1] = -1;
+    if (me->futex_pipe[1] != -1) {
+        close(me->futex_pipe[1]);
+        me->futex_pipe[1] = -1;
     }
 
     // sighand must be released below so it can be protected by pids_lock
     // since it can be accessed by other threads
 
     // save things that our parent might be interested in
-    current->exit_code = status; // FIXME locking
+    me->exit_code = status; // FIXME locking
     struct rusage_ rusage = rusage_get_current();
-    lock(&current->group->lock);
-    rusage_add(&current->group->rusage, &rusage);
-    struct rusage_ group_rusage = current->group->rusage;
-    unlock(&current->group->lock);
+    lock(&me->group->lock);
+    rusage_add(&me->group->rusage, &rusage);
+    struct rusage_ group_rusage = me->group->rusage;
+    unlock(&me->group->lock);
 
     // the actual freeing needs pids_lock
     lock(&pids_lock);
-    current->exiting = true;
+    me->exiting = true;
     // release the sighand (may already be NULL if another thread in the group
     // exited concurrently and released it, e.g. after safety-valve SIGUSR1)
-    if (current->sighand != NULL) {
-        sighand_release(current->sighand);
-        current->sighand = NULL;
+    if (me->sighand != NULL) {
+        sighand_release(me->sighand);
+        me->sighand = NULL;
     }
     struct sigqueue *sigqueue, *sigqueue_tmp;
-    list_for_each_entry_safe(&current->queue, sigqueue, sigqueue_tmp, queue) {
+    list_for_each_entry_safe(&me->queue, sigqueue, sigqueue_tmp, queue) {
         list_remove(&sigqueue->queue);
         free(sigqueue);
     }
-    struct task *leader = current->group->leader;
+    struct task *leader = me->group->leader;
 
     // reparent children
-    struct task *new_parent = find_new_parent(current);
+    struct task *new_parent = find_new_parent(me);
     struct task *child, *tmp;
-    list_for_each_entry_safe(&current->children, child, tmp, siblings) {
+    list_for_each_entry_safe(&me->children, child, tmp, siblings) {
         child->parent = new_parent;
         list_remove(&child->siblings);
         list_add(&new_parent->children, &child->siblings);
     }
 
-    if (exit_tgroup(current)) {
+    if (exit_tgroup(me)) {
         // If already marked zombie by do_exit_group force path, skip
         if (leader->zombie)
             goto skip_zombie_notify;
 
         // notify parent that we died
         struct task *parent = leader->parent;
-        if (parent == NULL && current->pid != 1) {
+        if (parent == NULL && me->pid != 1) {
             // Non-init process with no parent - try to find one
             // This can happen during reparenting or if parent exited first
             parent = pid_get_task(1); // Reparent to init
@@ -178,9 +196,9 @@ noreturn void do_exit(int status) {
             pidfd_notify_exit(leader->pid);
             struct siginfo_ info = {
                 .code = SI_KERNEL_,
-                .child.pid = current->pid,
-                .child.uid = current->uid,
-                .child.status = current->exit_code,
+                .child.pid = me->pid,
+                .child.uid = me->uid,
+                .child.status = me->exit_code,
                 .child.utime = clock_from_timeval(group_rusage.utime),
                 .child.stime = clock_from_timeval(group_rusage.stime),
             };
@@ -189,15 +207,17 @@ noreturn void do_exit(int status) {
         }
 
         if (exit_hook != NULL)
-            exit_hook(current, status);
+            exit_hook(me, status);
     skip_zombie_notify: ;
     }
 
-    vfork_notify(current);
-    if (current != leader) {
-        struct task *self = current;
-        current = NULL;  // Clear before destroy to prevent dangling access
-        task_destroy(self);
+    vfork_notify(me);
+    if (me != leader) {
+        // Only republish NULL if the global still names us; a live task may
+        // have published itself to current since we released the engine lock.
+        if (current == me)
+            current = NULL;
+        task_destroy(me);
     }
     unlock(&pids_lock);
 
@@ -205,31 +225,36 @@ noreturn void do_exit(int status) {
 }
 
 noreturn void do_exit_group(int status) {
+    // [T-ish-current-global] Same treatment as do_exit: work off our own
+    // task pointer; the process-wide current changes hands under the
+    // guest engine lock while this exit path runs lock-free.
+    struct task *me = current;
 #ifdef ISH_GADGET_PROFILE
     extern void dump_gadget_profile(void);
     static int dumped = 0;
-    if (!dumped && current && current->pid == 1) {
+    if (!dumped && me && me->pid == 1) {
         dumped = 1;
         dump_gadget_profile();
     }
 #endif
     /* Per-process PC histogram for cross-subprocess aggregation (pip build). */
     { extern char *getenv(const char *);
-      if (current && getenv("ISH_PC_HIST_DIR")) { extern void dump_pc_hist(void); dump_pc_hist(); } }
+      if (me && getenv("ISH_PC_HIST_DIR")) { extern void dump_pc_hist(void); dump_pc_hist(); } }
     /* Stage trace: dump when init exits (covers all forked guest processes). */
     { extern void dump_stage_trace(void);
       static int st_dumped = 0;
-      if (!st_dumped && current && current->pid == 1) { st_dumped = 1; dump_stage_trace(); } }
+      if (!st_dumped && me && me->pid == 1) { st_dumped = 1; dump_stage_trace(); } }
     /* Block execution profile (trace-AOT recording). */
     { extern void dump_block_prof(void);
       static int bp_dumped = 0;
-      if (!bp_dumped && current && current->pid == 1) { bp_dumped = 1; dump_block_prof(); } }
+      if (!bp_dumped && me && me->pid == 1) { bp_dumped = 1; dump_block_prof(); } }
     // Leaked thread woke up after group already exited — bail silently.
-    if (current->exiting) {
-        current = NULL;
+    if (me->exiting) {
+        if (current == me)
+            current = NULL;
         pthread_exit(NULL);
     }
-    struct tgroup *group = current->group;
+    struct tgroup *group = me->group;
     lock(&pids_lock);
     lock(&group->lock);
     bool is_group_leader = false;
@@ -273,7 +298,7 @@ noreturn void do_exit_group(int status) {
             // Count threads still in the group (excluding current)
             int remaining = 0;
             list_for_each_entry(&group->threads, task, group_links) {
-                if (task != current) {
+                if (task != me) {
                     remaining++;
                 }
             }
@@ -297,7 +322,7 @@ noreturn void do_exit_group(int status) {
             // Threads are stuck in blocking syscalls and won't exit.
             if (ish_exec_trace())
                 printk("SAFETY-VALVE[exit]: pid=%d do_exit_group waited %dms, %d threads still stuck → force kill\n",
-                       current->pid, waited_ms, last_remaining);
+                       me->pid, waited_ms, last_remaining);
 
             // Signal stuck threads with SIGUSR1 repeatedly.
             // Don't use pthread_cancel — it can corrupt malloc state if the
@@ -307,7 +332,7 @@ noreturn void do_exit_group(int status) {
                 lock(&group->lock);
                 int still_alive = 0;
                 list_for_each_entry(&group->threads, task, group_links) {
-                    if (task != current && !task->exiting) {
+                    if (task != me && !task->exiting) {
                         still_alive++;
                         cpu_poke(&task->cpu);
                         if (task->thread)
@@ -330,7 +355,7 @@ noreturn void do_exit_group(int status) {
             int leaked = 0;
             struct task *task_tmp;
             list_for_each_entry_safe(&group->threads, task, task_tmp, group_links) {
-                if (task != current && !task->exiting) {
+                if (task != me && !task->exiting) {
                     task->exiting = true;
                     list_remove(&task->group_links);
                     // Release resources so pipes get EOF and memory is freed.
@@ -370,7 +395,7 @@ noreturn void do_exit_group(int status) {
             unlock(&pids_lock);
             if (leaked > 0 && ish_exec_trace())
                 printk("SAFETY-VALVE[exit]: pid=%d leaked %d stuck host threads\n",
-                       current->pid, leaked);
+                       me->pid, leaked);
         } else {
 
             // Give extra time for pthread cleanup on host system

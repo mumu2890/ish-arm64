@@ -22,8 +22,8 @@ struct path_cache_entry {
 };
 
 // Thread-local cache (one per thread for lock-free access)
-static __thread struct path_cache_entry path_cache[PATH_CACHE_SIZE];
-static __thread bool path_cache_initialized = false;
+static struct path_cache_entry path_cache[PATH_CACHE_SIZE];
+static bool path_cache_initialized = false;
 
 // Simple hash function for path strings
 static inline uint32_t path_hash(const char *str) {

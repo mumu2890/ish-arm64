@@ -50,6 +50,11 @@ struct task {
     // Set when thread is in a blocking syscall (futex_wait, poll_wait, etc.)
     // Used for deadlock detection: if all threads are blocking, it's a hang.
     bool blocking;
+    // 1 while this task's host thread holds guest_engine_lock (task.c).
+    // current is a process-wide global (TLS stripped for the iOS TLVP
+    // kill), so guest engine execution is serialized and this flag tracks
+    // the holding thread across parks (wait_for) and do_exit.
+    int engine_held;
     // Per-thread pipe for futex_wait wakeup (reused across calls to avoid
     // pipe creation overhead in Go runtime spin loops)
     int futex_pipe[2]; // [0]=read, [1]=write; -1 if not yet created
@@ -142,7 +147,7 @@ struct task {
 
 // current will always give the process that is currently executing
 // if I have to stop using __thread, current will become a macro
-extern __thread struct task *current;
+extern struct task *current;
 
 static inline void task_set_mm(struct task *task, struct mm *mm) {
     task->mm = mm;
@@ -154,6 +159,8 @@ static inline void task_set_mm(struct task *task, struct mm *mm) {
 // parent as NULL to create the init process. Returns NULL if out of memory.
 // Ends with an underscore because there's a mach function by the same name
 struct task *task_create_(struct task *parent);
+void task_inherit_identity(struct task *dst, struct task *src);
+struct tgroup *tgroup_copy(struct tgroup *old_group); // non-static: task.c uses it for exec tasks
 // Removes the process from the process table and frees it. Must be called with pids_lock.
 void task_destroy(struct task *task);
 
@@ -259,7 +266,12 @@ struct task *pid_get_task_zombie(dword_t id); // don't return null if the task e
 int task_start_checked(struct task *task);
 __attribute__((warn_unused_result))
 int task_start(struct task *task);
-void task_run_current(void);
+// [T-ish-current-global] Serializes guest engine execution: current is a
+// process-wide global, so only one guest thread may run the engine +
+// syscall dispatch at a time. do_exit (exit.c) and the wait_for park
+// (util/sync.c) release it across blocking windows.
+extern pthread_mutex_t guest_engine_lock;
+void task_run_current(struct task *self);
 
 extern void (*exit_hook)(struct task *task, int code);
 

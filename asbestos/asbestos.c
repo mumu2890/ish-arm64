@@ -28,7 +28,7 @@
 // This avoids the overhead of _setjmp on every block entry (~1.5% of
 // total execution time). The signal handler writes crash info directly
 // to cpu_state via the _cpu pointer (x1) from ucontext.
-__thread volatile sig_atomic_t in_jit;
+volatile sig_atomic_t in_jit;
 _Atomic uint64_t s_dispatch_iterations = 0;
 _Atomic uint64_t st_block_cache_miss = 0, st_block_compile = 0, st_chain_attempts = 0;
 _Atomic uint64_t st_int_poke = 0, st_int_poke_foreign = 0, st_int_cycle = 0, st_poke_calls = 0;
@@ -38,7 +38,7 @@ _Atomic uint64_t st_int_poke = 0, st_int_poke_foreign = 0, st_int_cycle = 0, st_
 int stage_trace_on(void) { return 0; }
 void dump_stage_trace(void) { }
 
-__thread volatile addr_t jit_saved_pc;  // block start PC, read by signal handler
+volatile addr_t jit_saved_pc;  // block start PC, read by signal handler
 
 // PC dispatch trace: capture first N consecutive guest PCs hitting the
 // dispatch loop. Used for V8-realistic micro-bench harness. Set
@@ -213,7 +213,7 @@ void dump_block_prof(void) {
 
 // Marker set to 1 on iSH execution threads so the signal handler can distinguish
 // iSH threads from app threads (Swift async, networking, UI).
-__thread int ish_thread_marker;
+int ish_thread_marker;
 
 // Architecture-specific instruction pointer access
 #if defined(GUEST_ARM64)

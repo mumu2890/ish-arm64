@@ -51,7 +51,7 @@ void ish_set_fork_guard(ish_fork_guard_t guard) {
 #define IMPLEMENTED_FLAGS (CLONE_VM_|CLONE_FILES_|CLONE_FS_|CLONE_SIGHAND_|CLONE_SYSVSEM_|CLONE_VFORK_|CLONE_THREAD_|\
         CLONE_SETTLS_|CLONE_CHILD_SETTID_|CLONE_PARENT_SETTID_|CLONE_CHILD_CLEARTID_|CLONE_DETACHED_)
 
-static struct tgroup *tgroup_copy(struct tgroup *old_group) {
+struct tgroup *tgroup_copy(struct tgroup *old_group) {
     struct tgroup *group = malloc(sizeof(struct tgroup));
     *group = *old_group;
     list_init(&group->threads);

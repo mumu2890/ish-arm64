@@ -48,11 +48,22 @@ int wait_for(cond_t *cond, lock_t *lock, struct timespec *timeout) {
 }
 
 int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout) {
-    if (current) {
-        lock(&current->waiting_cond_lock);
-        current->waiting_cond = cond;
-        current->waiting_lock = lock;
-        unlock(&current->waiting_cond_lock);
+    struct task *me = current;
+    if (me) {
+        lock(&me->waiting_cond_lock);
+        me->waiting_cond = cond;
+        me->waiting_lock = lock;
+        unlock(&me->waiting_cond_lock);
+    }
+    // [T-ish-current-global] Park with the guest engine lock RELEASED: a
+    // parent blocked in wait4 must not hold it, or its forked child can
+    // never run the engine and exit. me (not the process-wide current)
+    // identifies us across the park. Lock order kept guest-outer: on wake
+    // we drop lock, take guest_engine_lock, then retake lock.
+    int was_engine = (me != NULL && me->engine_held);
+    if (was_engine) {
+        me->engine_held = 0;
+        pthread_mutex_unlock(&guest_engine_lock);
     }
     int rc = 0;
 #if LOCK_DEBUG
@@ -82,11 +93,19 @@ int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout
     lock->debug = lock_tmp;
 #endif
 
-    if (current) {
-        lock(&current->waiting_cond_lock);
-        current->waiting_cond = NULL;
-        current->waiting_lock = NULL;
-        unlock(&current->waiting_cond_lock);
+    if (me) {
+        lock(&me->waiting_cond_lock);
+        me->waiting_cond = NULL;
+        me->waiting_lock = NULL;
+        unlock(&me->waiting_cond_lock);
+    }
+    if (was_engine) {
+        // Reacquire in guest-outer order (see pre-park note).
+        unlock(lock);
+        pthread_mutex_lock(&guest_engine_lock);
+        lock(lock);
+        current = me;
+        me->engine_held = 1;
     }
     if (rc == ETIMEDOUT)
         return _ETIMEDOUT;
@@ -100,8 +119,8 @@ void notify_once(cond_t *cond) {
     pthread_cond_signal(&cond->cond);
 }
 
-__thread sigjmp_buf unwind_buf;
-__thread bool should_unwind = false;
+sigjmp_buf unwind_buf;
+bool should_unwind = false;
 
 void sigusr1_handler() {
     if (should_unwind) {

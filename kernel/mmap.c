@@ -139,7 +139,7 @@ void anon_pages_unreserve(long pages) {
 // Thread-local because the reserve and the map always happen on the same
 // thread, back to back, under mem->lock — a global would let two concurrent
 // mappers steal each other's credit.
-static __thread long anon_precharged_pages;
+static long anon_precharged_pages = 0;
 
 void anon_pages_precharged(long pages) {
     anon_precharged_pages = pages;
@@ -264,6 +264,11 @@ void mm_retain(struct mm *mm) {
 }
 
 void mm_release(struct mm *mm) {
+    // A fresh task (task_create_(NULL) / exec before any mm) may swap in a
+    // brand-new mm while still holding no old one: old_mm == NULL is a
+    // legal "release nothing" and must be a no-op, not a NULL deref.
+    if (mm == NULL)
+        return;
     if (--mm->refcount == 0) {
         if (mm->exefile != NULL)
             fd_close(mm->exefile);
